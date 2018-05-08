@@ -1,0 +1,199 @@
+heat_template_version: 2013-05-23
+
+description: >
+  WordPress is web software you can use to create a beautiful website or blog.
+  This template installs a single-instance WordPress deployment using a local
+  MySQL database to store the data.
+
+parameters:
+  name:
+    type: string
+    label: ECS Name
+    description: Specifies the ECS name.
+    default: TESTWORDPRESS
+  key_name:
+    type: string
+    label: Key Pair
+    description: Specifies the key pair used for creating ECS. The value can be the name of the key pair.
+    default: KeyPair-ef28
+  flavor:
+    type: string
+    label: Flavor Name
+    description: Specifies the flavor used for creating ECS.
+    default: s3.large.2
+  image:
+    type: string
+    label: Image Name or ID
+    description: Specifies the image used for creating ECS(CentOS 7 Series). The value can be the name or ID of the image.
+    default: "CentOS 7.4 64bit"
+  networks:
+    type: string
+    label: Network Name or ID
+    description: Specifies the network used for creating ECS. The value can be the name or ID of the network.
+    default: 66306ba3-f236-4554-b2ea-b12a0b4229d2
+  availability_zone:
+    type: string
+    label: AZ Name
+    description: Specifies the name of the AZ to which the ECS belong.
+    default: cn-north-1b
+  volume_name:
+    type: string
+    label: EVS name
+    description: Specifies the volume name for boot ECS server.
+    default: BOOTVOL
+  volume_size:
+    type: number
+    label: Evs volume size
+    description: Specifies the volume size.
+    default: 100
+  sg_name:
+    type: string
+    label: SecurityGroup name
+    description: Specifies the SecurityGroup name for boot ECS server.
+    default: security_groups_wordpress
+
+  db_name:
+    type: string
+    description: WordPress database name
+    constraints:
+      - length: { min: 1, max: 64 }
+        description: db_name must be between 1 and 64 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_name must begin with a letter and contain only alphanumeric
+          characters
+    default: wordpressdb
+  db_username:
+    type: string
+    description: The WordPress database admin account username
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 16 }
+        description: db_username must be between 1 and 16 characters
+      - allowed_pattern: '[a-zA-Z][a-zA-Z0-9]*'
+        description: >
+          db_username must begin with a letter and contain only alphanumeric
+          characters
+    default: wordpressuser
+  db_password:
+    type: string
+    description: The WordPress database admin account password
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_password must contain only alphanumeric characters
+    default: Passw0rd
+  db_root_password:
+    type: string
+    description: Root password for MySQL
+    hidden: true
+    constraints:
+      - length: { min: 1, max: 41 }
+        description: db_root_password must be between 1 and 41 characters
+      - allowed_pattern: '[a-zA-Z0-9]*'
+        description: db_root_password must contain only alphanumeric characters
+    default: Passw0rd
+
+parameter_groups:
+  - label: wordpress
+    parameters:
+      - name
+      - image
+      - key_name
+      - flavor
+      - networks
+      - availability_zone
+      - db_name
+      - db_username
+      - db_password
+      - db_root_password
+
+resources:
+  wordpress_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: wordpress_sg
+      description: security group used by ONAP
+      rules:
+        - {direction: egress, ethertype: IPv4}
+        - {direction: ingress, protocol: icmp}
+        - {direction: egress, protocol: icmp} 
+        - {direction: egress, protocol: tcp, port_range_min: 1, port_range_max: 65535}
+        - {direction: ingress, protocol: tcp, port_range_min: 22, port_range_max: 22}
+        - {direction: ingress, protocol: tcp, port_range_min: 80, port_range_max: 80}
+
+  volume_instance:
+    type: OS::Cinder::Volume
+    properties:
+      name: { get_param: volume_name }
+      size: { get_param: volume_size }
+      image: { get_param: image }
+
+  wordpress_instance:
+    type: OS::Nova::Server
+    properties:
+      security_groups: 
+        - { get_resource: wordpress_sg }
+      name: { get_param: name } 
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_param: networks }
+      availability_zone: { get_param: availability_zone }
+      block_device_mapping_v2:
+        - device_name: vda
+          volume_id: {get_resource: volume_instance}
+          boot_index: 0
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash -v
+            echo "123456" | passwd --stdin root
+            yum -y install mariadb mariadb-server httpd wordpress
+            systemctl enable mariadb.service
+            systemctl enable httpd.service
+            systemctl start mariadb.service
+            systemctl start httpd.service
+
+            firewall-cmd --add-service=http
+            firewall-cmd --permanent --add-service=http
+
+            # Setup MySQL root password and create a user
+            mysqladmin -u root password db_rootpassword
+            cat << EOF | mysql -u root --password=db_rootpassword
+            CREATE DATABASE db_name;
+            GRANT ALL PRIVILEGES ON db_name.* TO "db_user"@"localhost"
+            IDENTIFIED BY "db_password";
+            FLUSH PRIVILEGES;
+            EXIT
+            EOF
+
+            sed -i "/Deny from All/d" /etc/httpd/conf.d/wordpress.conf
+            sed -i "s/Require local/Require all granted/" /etc/httpd/conf.d/wordpress.conf
+            sed -i s/database_name_here/db_name/ /etc/wordpress/wp-config.php
+            sed -i s/username_here/db_user/ /etc/wordpress/wp-config.php
+            sed -i s/password_here/db_password/ /etc/wordpress/wp-config.php
+
+            systemctl restart httpd.service
+          params:
+            db_rootpassword: { get_param: db_root_password }
+            db_name: { get_param: db_name }
+            db_user: { get_param: db_username }
+            db_password: { get_param: db_password }
+  floating_ip:  
+    type: OS::Neutron::FloatingIP  
+    depends_on: wordpress_instance  
+    properties:  
+      floating_network: admin_external_net  
+      port_id: { get_attr: [wordpress_instance, addresses, { get_param: networks }, 0, port]}   
+
+outputs:
+  WebsiteURL:
+    description: URL for Wordpress
+    value:
+      str_replace:
+        template: http://host/wordpress
+        params:
+          host: { get_attr: [floating_ip, floating_ip_address] }
